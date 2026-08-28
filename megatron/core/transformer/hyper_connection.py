@@ -249,7 +249,11 @@ class HyperConnectionModule(MegatronModule):
         mark_keep_in_fp32(self.alpha_post)
         mark_keep_in_fp32(self.alpha_res)
         mark_keep_in_fp32(self.bias)
-        self.norm_eps = 1e-6
+        # GLM uses the model RMSNorm epsilon for the input normalization while
+        # keeping the distinct mHC/Sinkhorn stabilizers at 1e-6.
+        self.norm_eps = (
+            config.layernorm_epsilon if config.mhc_rms_epsilon_inside_sqrt else 1e-6
+        )
 
         # Choose implementation: unified fused kernels vs reference modules.
         # The fused public API selects the backend per operation internally.

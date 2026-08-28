@@ -53,6 +53,7 @@ def test_glm_mhc_mapping_matches_bf16_reference_forward_backward():
         use_cpu_initialization=True,
         bf16=True,
         params_dtype=torch.bfloat16,
+        layernorm_epsilon=1e-5,
         enable_mhc_connections=True,
         mhc_num_residual_streams=4,
         mhc_sinkhorn_iterations=20,
@@ -64,7 +65,7 @@ def test_glm_mhc_mapping_matches_bf16_reference_forward_backward():
     assert module.bias.dtype == torch.float32
     assert module.alpha_pre.dtype == torch.float32
 
-    x_actual = torch.randn(3, 2, 32, dtype=torch.bfloat16, requires_grad=True)
+    x_actual = (torch.randn(3, 2, 32, dtype=torch.bfloat16) * 1e-3).requires_grad_(True)
     x_reference = x_actual.detach().clone().requires_grad_(True)
     fn = module.mapping_proj.weight.detach().clone().requires_grad_(True)
     base = module.bias.detach().clone().requires_grad_(True)
@@ -76,7 +77,9 @@ def test_glm_mhc_mapping_matches_bf16_reference_forward_backward():
     actual = module(x_actual)
 
     flat = x_reference.float()
-    normalized = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-6)
+    normalized = flat * torch.rsqrt(
+        flat.square().mean(-1, keepdim=True) + config.layernorm_epsilon
+    )
     projected = F.linear(normalized, fn.float())
     pre_w, post_w, comb_w = projected.split([4, 4, 16], dim=-1)
     pre_b, post_b, comb_b = base.split([4, 4, 16])
