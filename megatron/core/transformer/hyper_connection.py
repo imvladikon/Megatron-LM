@@ -120,6 +120,17 @@ def native_h_post_bda(
     return x_expanded + mixed
 
 
+def eager_h_post_bda(
+    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+) -> Tensor:
+    """Unfused BF16 stream update matching GLM's eager operation boundaries."""
+    mixed = torch.matmul(h_res.transpose(-1, -2), original_residual)
+    expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
+    if bias is not None:
+        expanded = expanded + h_post.unsqueeze(-1) * bias.view(1, 1, 1, -1)
+    return expanded + mixed
+
+
 @torch.compile
 def native_proj_rms(
     x: Tensor, weight: Tensor, eps: float = 1e-6, epsilon_inside_sqrt: bool = False
@@ -285,7 +296,14 @@ class HyperConnectionModule(MegatronModule):
         else:
             self._sinkhorn_op = native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
-            self._h_post_bda_op = native_h_post_bda
+            # Compiling the final BF16 multiply-add can fuse away the rounding
+            # boundary present in the GLM reference and changes forward and
+            # backward values. Preserve the eager operation boundary for GLM.
+            self._h_post_bda_op = (
+                eager_h_post_bda
+                if config.mhc_rms_epsilon_inside_sqrt
+                else native_h_post_bda
+            )
             self._proj_rms_compute_h_op = None
 
         self._init_weights()

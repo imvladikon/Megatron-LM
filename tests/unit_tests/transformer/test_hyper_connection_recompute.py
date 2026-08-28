@@ -11,6 +11,8 @@ Tests the following functionality:
 5. TransformerConfig 'mhc' in recompute_modules option
 """
 
+import copy
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -19,7 +21,11 @@ from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutputManager,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.hyper_connection import HyperConnectionModule, native_proj_rms
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    eager_h_post_bda,
+    native_proj_rms,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -113,6 +119,68 @@ def test_glm_mhc_mapping_matches_bf16_reference_forward_backward():
         (module.alpha_pre, module.alpha_post, module.alpha_res), scales
     ):
         torch.testing.assert_close(parameter.grad, reference_scale.grad, atol=1e-6, rtol=1e-6)
+
+
+def test_glm_mhc_final_stream_update_matches_eager_bf16_reference():
+    torch.manual_seed(29)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        use_cpu_initialization=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        layernorm_epsilon=1e-5,
+        hidden_dropout=0.0,
+        enable_mhc_connections=True,
+        mhc_num_residual_streams=4,
+        mhc_sinkhorn_iterations=20,
+        mhc_rms_epsilon_inside_sqrt=True,
+        mhc_mapping_proj_fp32=False,
+    )
+    module = HyperConnectionModule(config=config, layer_number=1)
+    reference_module = copy.deepcopy(module)
+    assert module._h_post_bda_op is eager_h_post_bda
+
+    hidden_actual = (torch.randn(3, 2, 32, dtype=torch.bfloat16) * 1e-3).requires_grad_(True)
+    hidden_reference = hidden_actual.detach().clone().requires_grad_(True)
+    update_actual = torch.randn(3, 2, 8, dtype=torch.bfloat16, requires_grad=True)
+    update_reference = update_actual.detach().clone().requires_grad_(True)
+
+    _, h_res, h_post, residual = module(hidden_actual, return_residual=True)
+    actual = module.fused_h_res_h_post_bda(
+        h_res,
+        residual,
+        h_post,
+        (update_actual, None),
+        dropout_prob=0.0,
+        training=True,
+        fused=False,
+    )
+
+    _, ref_h_res, ref_h_post, ref_residual = reference_module(
+        hidden_reference, return_residual=True
+    )
+    s, b, _ = ref_residual.shape
+    reference = (
+        ref_h_post.unsqueeze(-1) * update_reference.unsqueeze(2)
+        + torch.matmul(
+            ref_h_res.transpose(-1, -2),
+            ref_residual.view(s, b, 4, config.hidden_size),
+        )
+    ).view(s, b, -1)
+
+    torch.testing.assert_close(actual, reference, atol=0.0, rtol=0.0)
+    actual.float().square().sum().backward()
+    reference.float().square().sum().backward()
+    torch.testing.assert_close(hidden_actual.grad, hidden_reference.grad, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(update_actual.grad, update_reference.grad, atol=0.0, rtol=0.0)
+    for actual_parameter, reference_parameter in zip(
+        module.parameters(), reference_module.parameters(), strict=True
+    ):
+        torch.testing.assert_close(
+            actual_parameter.grad, reference_parameter.grad, atol=0.0, rtol=0.0
+        )
 
 
 class TestHyperConnectionModuleCheckpoint:
