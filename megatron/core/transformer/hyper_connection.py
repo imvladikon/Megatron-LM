@@ -142,7 +142,7 @@ def native_proj_rms(
         # GLM normalizes the FP32 activation before F.linear.  Scaling the
         # projection afterwards is algebraically equivalent but not bitwise
         # equivalent, and the difference survives the BF16 output cast.
-        proj = torch.matmul(x * r, weight.t())
+        proj = F.linear(x * r, weight)
         return proj, torch.ones_like(r)
     proj = torch.matmul(x, weight.t())
     r = torch.reciprocal(torch.sqrt(mean_square) + eps)
@@ -226,6 +226,11 @@ class HyperConnectionModule(MegatronModule):
 
     def __init__(self, config: TransformerConfig, layer_number: int):
         super().__init__(config)
+        if config.mhc_rms_epsilon_inside_sqrt and config.use_fused_mhc:
+            raise ValueError(
+                "Fused mHC does not implement mhc_rms_epsilon_inside_sqrt; "
+                "disable use_fused_mhc for GLM-compatible mHC math."
+            )
         self.config = config
         self.layer_number = layer_number
         self.n = config.mhc_num_residual_streams

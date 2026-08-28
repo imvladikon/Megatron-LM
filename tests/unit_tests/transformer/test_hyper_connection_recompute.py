@@ -183,6 +183,15 @@ def test_glm_mhc_final_stream_update_matches_eager_bf16_reference():
         )
 
 
+def test_glm_mhc_module_rejects_fused_mode_after_config_mutation():
+    config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=2)
+    config.enable_mhc_connections = True
+    config.mhc_rms_epsilon_inside_sqrt = True
+    config.use_fused_mhc = True
+    with pytest.raises(ValueError, match="does not implement"):
+        HyperConnectionModule(config=config, layer_number=1)
+
+
 class TestHyperConnectionModuleCheckpoint:
     """Test HyperConnectionModule checkpoint functionality."""
 
