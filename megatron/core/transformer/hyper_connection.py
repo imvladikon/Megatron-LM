@@ -125,12 +125,16 @@ def native_proj_rms(
     x: Tensor, weight: Tensor, eps: float = 1e-6, epsilon_inside_sqrt: bool = False
 ) -> Tuple[Tensor, Tensor]:
     """Native fused projection + RMS normalization."""
-    proj = torch.matmul(x, weight.t())
     mean_square = x.pow(2).mean(dim=-1, keepdim=True)
     if epsilon_inside_sqrt:
         r = torch.rsqrt(mean_square + eps)
-    else:
-        r = torch.reciprocal(torch.sqrt(mean_square) + eps)
+        # GLM normalizes the FP32 activation before F.linear.  Scaling the
+        # projection afterwards is algebraically equivalent but not bitwise
+        # equivalent, and the difference survives the BF16 output cast.
+        proj = torch.matmul(x * r, weight.t())
+        return proj, torch.ones_like(r)
+    proj = torch.matmul(x, weight.t())
+    r = torch.reciprocal(torch.sqrt(mean_square) + eps)
     return proj, r
 
 
@@ -225,7 +229,10 @@ class HyperConnectionModule(MegatronModule):
         # - H_post: n values
         # - H_res: n^2 values (before Sinkhorn projection)
         self.mapping_proj = nn.Linear(
-            self.n * self.hidden_size, self.n * self.n + 2 * self.n, bias=False
+            self.n * self.hidden_size,
+            self.n * self.n + 2 * self.n,
+            bias=False,
+            dtype=(torch.float32 if config.mhc_mapping_proj_fp32 else config.params_dtype),
         )
 
         init_alpha = config.mhc_init_gating_factor
@@ -236,7 +243,8 @@ class HyperConnectionModule(MegatronModule):
 
         # Static bias terms
         self.bias = nn.Parameter(torch.zeros(self.n * self.n + 2 * self.n))
-        mark_keep_in_fp32(self.mapping_proj.weight)
+        if config.mhc_mapping_proj_fp32:
+            mark_keep_in_fp32(self.mapping_proj.weight)
         mark_keep_in_fp32(self.alpha_pre)
         mark_keep_in_fp32(self.alpha_post)
         mark_keep_in_fp32(self.alpha_res)
@@ -400,7 +408,11 @@ class HyperConnectionModule(MegatronModule):
         # matrix), so after the FP32 computation they are safe to apply to the
         # streams in the activation dtype.
         dtype = x.dtype
-        return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
+        # GLM applies the FP32 pre weights to BF16 streams, reduces in FP32,
+        # and only then casts the collapsed activation.  Post/residual weights
+        # are explicitly cast before their application in the reference.
+        h_pre_out = h_pre if self.config.mhc_rms_epsilon_inside_sqrt else h_pre.to(dtype)
+        return h_pre_out, h_post.to(dtype), h_res.to(dtype)
 
     @torch.compile
     def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
@@ -499,7 +511,7 @@ class HyperConnectionModule(MegatronModule):
         s, b, _ = x.shape
         C = self.hidden_size
         x_streams = x.view(s, b, self.n, C)
-        return self._h_aggregate_op(x_streams, h_pre)
+        return self._h_aggregate_op(x_streams, h_pre).to(x.dtype)
 
     @torch.compile
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:
