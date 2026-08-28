@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import math
 from functools import partial
 from typing import Optional, Tuple
 
@@ -122,13 +121,16 @@ def native_h_post_bda(
 
 
 @torch.compile
-def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
+def native_proj_rms(
+    x: Tensor, weight: Tensor, eps: float = 1e-6, epsilon_inside_sqrt: bool = False
+) -> Tuple[Tensor, Tensor]:
     """Native fused projection + RMS normalization."""
     proj = torch.matmul(x, weight.t())
-    norm = x.norm(dim=-1, keepdim=True)
-    K = x.shape[-1]
-    v = norm / math.sqrt(K) + eps
-    r = 1.0 / v
+    mean_square = x.pow(2).mean(dim=-1, keepdim=True)
+    if epsilon_inside_sqrt:
+        r = torch.rsqrt(mean_square + eps)
+    else:
+        r = torch.reciprocal(torch.sqrt(mean_square) + eps)
     return proj, r
 
 
@@ -307,7 +309,12 @@ class HyperConnectionModule(MegatronModule):
         # the bounded mixing weights back to the activation dtype.
         x_2d = x.reshape(s * b, nC).to(torch.float32)
         weight = self.mapping_proj.weight.to(torch.float32)
-        proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
+        proj, r = self._proj_rms_op(
+            x_2d,
+            weight,
+            self.norm_eps,
+            self.config.mhc_rms_epsilon_inside_sqrt,
+        )
         return proj.view(s, b, -1), r.view(s, b, 1)
 
     @torch.compile

@@ -18,9 +18,27 @@ from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutputManager,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import HyperConnectionModule, native_proj_rms
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_native_proj_rms_supports_rmsnorm_epsilon_contract():
+    """Checkpoints can select epsilon inside sqrt without changing the default."""
+    x = torch.tensor([[0.0, 0.0], [3.0, 4.0]], dtype=torch.float32)
+    weight = torch.eye(2, dtype=torch.float32)
+    eps = 1e-6
+
+    projection, inside = native_proj_rms(x, weight, eps, True)
+    _, outside = native_proj_rms(x, weight, eps, False)
+
+    torch.testing.assert_close(projection, x, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(inside, torch.rsqrt(x.square().mean(-1, keepdim=True) + eps))
+    torch.testing.assert_close(
+        outside,
+        torch.reciprocal(torch.sqrt(x.square().mean(-1, keepdim=True)) + eps),
+    )
+    assert not torch.equal(inside, outside)
 
 
 class TestHyperConnectionModuleCheckpoint:

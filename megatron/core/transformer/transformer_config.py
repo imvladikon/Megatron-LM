@@ -1184,6 +1184,14 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
+    mhc_rms_epsilon_inside_sqrt: bool = False
+    """Apply the mHC projection RMS epsilon inside the square root.
+
+    The default preserves Megatron's ``1 / (rms(x) + eps)`` contract. Some
+    released checkpoints, including GLM-5.3-Flash, use RMSNorm semantics and
+    require ``rsqrt(mean(x**2) + eps)`` instead.
+    """
+
     use_fused_mhc: bool = False
     """Use fused kernels for mHC operations when supported.
 
@@ -2188,10 +2196,10 @@ class TransformerConfig(ModelParallelConfig):
                 "The fused inference TP path assumes single-stream residual tensors."
             )
 
-        # Note: mHC + MoE is deliberately NOT rejected here. HyperConnectionTransformerLayer
-        # raises for a MoE MLP submodule at build time, which is the precise check; a
-        # config-level `num_moe_experts` guard would also block the documented composition
-        # (wrapping MoE as a HybridStack layer via HyperConnectionHybridLayer).
+        # mHC composes with either a dense or MoE MLP through the common
+        # TransformerLayer forward skeleton. HyperConnectionHybridLayer remains
+        # available when the entire hybrid block, rather than one GPT layer,
+        # needs to be wrapped.
 
         if self.enable_mhc_connections:
             # TransformerBlock expands to n-stream at `pre_process` and contracts back at
