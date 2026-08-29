@@ -2,6 +2,7 @@
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -31,6 +32,37 @@ from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
+
+
+_SLIME_ROUTING_REPLAY = None
+_SLIME_ROUTING_REPLAY_RESOLVED = False
+
+
+def get_slime_routing_replay():
+    """Return Slime's optional routing-replay module.
+
+    Megatron-Core must remain usable without Slime. When Slime's replay
+    protocol is explicitly enabled, silently falling back would train with
+    different routing, so fail with an actionable error instead.
+    """
+    global _SLIME_ROUTING_REPLAY, _SLIME_ROUTING_REPLAY_RESOLVED
+
+    if not _SLIME_ROUTING_REPLAY_RESOLVED:
+        try:
+            from slime.utils import routing_replay
+        except ModuleNotFoundError as exc:
+            if exc.name != "slime":
+                raise
+            routing_replay = None
+        _SLIME_ROUTING_REPLAY = routing_replay
+        _SLIME_ROUTING_REPLAY_RESOLVED = True
+
+    if _SLIME_ROUTING_REPLAY is None and os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+        raise RuntimeError(
+            "ENABLE_ROUTING_REPLAY=1 requires THUDM/slime with "
+            "slime.utils.routing_replay available on PYTHONPATH"
+        )
+    return _SLIME_ROUTING_REPLAY
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -893,9 +925,9 @@ def topk_routing_with_score_function(
                 scores, topk, num_groups, group_topk, _compute_topk
             )
 
-    from slime.utils.routing_replay import get_routing_replay_compute_topk
-
-    compute_topk = get_routing_replay_compute_topk(compute_topk)
+    slime_routing_replay = get_slime_routing_replay()
+    if slime_routing_replay is not None:
+        compute_topk = slime_routing_replay.get_routing_replay_compute_topk(compute_topk)
 
     # Precision notes:
     # - Logits are converted to fp32 for score functions.
