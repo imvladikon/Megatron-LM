@@ -1200,6 +1200,22 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
+    mhc_rms_epsilon_inside_sqrt: bool = False
+    """Apply the mHC projection RMS epsilon inside the square root.
+
+    The default preserves Megatron's ``1 / (rms(x) + eps)`` contract. Some
+    released checkpoints, including GLM-5.3-Flash, use RMSNorm semantics and
+    require ``rsqrt(mean(x**2) + eps)`` instead.
+    """
+
+    mhc_mapping_proj_fp32: bool = True
+    """Keep the mHC mapping projection parameter in FP32.
+
+    Disable this for checkpoints such as GLM-5.3-Flash whose mapping function
+    parameter is stored and optimized in BF16 while its linear calculation is
+    explicitly upcast to FP32.
+    """
+
     use_fused_mhc: bool = False
     """Use fused kernels for mHC operations when supported.
 
@@ -2249,12 +2265,17 @@ class TransformerConfig(ModelParallelConfig):
                 "The fused inference TP path assumes single-stream residual tensors."
             )
 
-        # Note: mHC + MoE is deliberately NOT rejected here. HyperConnectionTransformerLayer
-        # raises for a MoE MLP submodule at build time, which is the precise check; a
-        # config-level `num_moe_experts` guard would also block the documented composition
-        # (wrapping MoE as a HybridStack layer via HyperConnectionHybridLayer).
+        # mHC composes with either a dense or MoE MLP through the common
+        # TransformerLayer forward skeleton. HyperConnectionHybridLayer remains
+        # available when the entire hybrid block, rather than one GPT layer,
+        # needs to be wrapped.
 
         if self.enable_mhc_connections:
+            if self.mhc_rms_epsilon_inside_sqrt and self.use_fused_mhc:
+                raise ValueError(
+                    "Fused mHC does not implement mhc_rms_epsilon_inside_sqrt; "
+                    "disable use_fused_mhc for GLM-compatible mHC math."
+                )
             # TransformerBlock expands to n-stream at `pre_process` and contracts back at
             # the stage holding the final layernorm, so every intermediate pipeline stage
             # exchanges [s, b, n*C] while the p2p buffers are still sized from hidden_size.

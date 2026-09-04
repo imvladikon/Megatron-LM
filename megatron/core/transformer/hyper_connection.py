@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import math
 from functools import partial
 from typing import Optional, Tuple
 
@@ -121,14 +120,32 @@ def native_h_post_bda(
     return x_expanded + mixed
 
 
+def eager_h_post_bda(
+    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+) -> Tensor:
+    """Unfused BF16 stream update matching GLM's eager operation boundaries."""
+    mixed = torch.matmul(h_res.transpose(-1, -2), original_residual)
+    expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
+    if bias is not None:
+        expanded = expanded + h_post.unsqueeze(-1) * bias.view(1, 1, 1, -1)
+    return expanded + mixed
+
+
 @torch.compile
-def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
+def native_proj_rms(
+    x: Tensor, weight: Tensor, eps: float = 1e-6, epsilon_inside_sqrt: bool = False
+) -> Tuple[Tensor, Tensor]:
     """Native fused projection + RMS normalization."""
+    mean_square = x.pow(2).mean(dim=-1, keepdim=True)
+    if epsilon_inside_sqrt:
+        r = torch.rsqrt(mean_square + eps)
+        # GLM normalizes the FP32 activation before F.linear.  Scaling the
+        # projection afterwards is algebraically equivalent but not bitwise
+        # equivalent, and the difference survives the BF16 output cast.
+        proj = F.linear(x * r, weight)
+        return proj, torch.ones_like(r)
     proj = torch.matmul(x, weight.t())
-    norm = x.norm(dim=-1, keepdim=True)
-    K = x.shape[-1]
-    v = norm / math.sqrt(K) + eps
-    r = 1.0 / v
+    r = torch.reciprocal(torch.sqrt(mean_square) + eps)
     return proj, r
 
 
@@ -209,6 +226,11 @@ class HyperConnectionModule(MegatronModule):
 
     def __init__(self, config: TransformerConfig, layer_number: int):
         super().__init__(config)
+        if config.mhc_rms_epsilon_inside_sqrt and config.use_fused_mhc:
+            raise ValueError(
+                "Fused mHC does not implement mhc_rms_epsilon_inside_sqrt; "
+                "disable use_fused_mhc for GLM-compatible mHC math."
+            )
         self.config = config
         self.layer_number = layer_number
         self.n = config.mhc_num_residual_streams
@@ -223,7 +245,10 @@ class HyperConnectionModule(MegatronModule):
         # - H_post: n values
         # - H_res: n^2 values (before Sinkhorn projection)
         self.mapping_proj = nn.Linear(
-            self.n * self.hidden_size, self.n * self.n + 2 * self.n, bias=False
+            self.n * self.hidden_size,
+            self.n * self.n + 2 * self.n,
+            bias=False,
+            dtype=(torch.float32 if config.mhc_mapping_proj_fp32 else config.params_dtype),
         )
 
         init_alpha = config.mhc_init_gating_factor
@@ -234,12 +259,17 @@ class HyperConnectionModule(MegatronModule):
 
         # Static bias terms
         self.bias = nn.Parameter(torch.zeros(self.n * self.n + 2 * self.n))
-        mark_keep_in_fp32(self.mapping_proj.weight)
+        if config.mhc_mapping_proj_fp32:
+            mark_keep_in_fp32(self.mapping_proj.weight)
         mark_keep_in_fp32(self.alpha_pre)
         mark_keep_in_fp32(self.alpha_post)
         mark_keep_in_fp32(self.alpha_res)
         mark_keep_in_fp32(self.bias)
-        self.norm_eps = 1e-6
+        # GLM uses the model RMSNorm epsilon for the input normalization while
+        # keeping the distinct mHC/Sinkhorn stabilizers at 1e-6.
+        self.norm_eps = (
+            config.layernorm_epsilon if config.mhc_rms_epsilon_inside_sqrt else 1e-6
+        )
 
         # Choose implementation: unified fused kernels vs reference modules.
         # The fused public API selects the backend per operation internally.
@@ -271,7 +301,14 @@ class HyperConnectionModule(MegatronModule):
         else:
             self._sinkhorn_op = native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
-            self._h_post_bda_op = native_h_post_bda
+            # Compiling the final BF16 multiply-add can fuse away the rounding
+            # boundary present in the GLM reference and changes forward and
+            # backward values. Preserve the eager operation boundary for GLM.
+            self._h_post_bda_op = (
+                eager_h_post_bda
+                if config.mhc_rms_epsilon_inside_sqrt
+                else native_h_post_bda
+            )
             self._proj_rms_compute_h_op = None
 
         self._init_weights()
@@ -307,7 +344,12 @@ class HyperConnectionModule(MegatronModule):
         # the bounded mixing weights back to the activation dtype.
         x_2d = x.reshape(s * b, nC).to(torch.float32)
         weight = self.mapping_proj.weight.to(torch.float32)
-        proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
+        proj, r = self._proj_rms_op(
+            x_2d,
+            weight,
+            self.norm_eps,
+            self.config.mhc_rms_epsilon_inside_sqrt,
+        )
         return proj.view(s, b, -1), r.view(s, b, 1)
 
     @torch.compile
@@ -393,7 +435,11 @@ class HyperConnectionModule(MegatronModule):
         # matrix), so after the FP32 computation they are safe to apply to the
         # streams in the activation dtype.
         dtype = x.dtype
-        return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
+        # GLM applies the FP32 pre weights to BF16 streams, reduces in FP32,
+        # and only then casts the collapsed activation.  Post/residual weights
+        # are explicitly cast before their application in the reference.
+        h_pre_out = h_pre if self.config.mhc_rms_epsilon_inside_sqrt else h_pre.to(dtype)
+        return h_pre_out, h_post.to(dtype), h_res.to(dtype)
 
     @torch.compile
     def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
@@ -492,7 +538,7 @@ class HyperConnectionModule(MegatronModule):
         s, b, _ = x.shape
         C = self.hidden_size
         x_streams = x.view(s, b, self.n, C)
-        return self._h_aggregate_op(x_streams, h_pre)
+        return self._h_aggregate_op(x_streams, h_pre).to(x.dtype)
 
     @torch.compile
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:

@@ -20,6 +20,7 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
+    get_slime_routing_replay,
     qb_dual_update,
     router_gating_linear,
     sinkhorn,
@@ -262,6 +263,10 @@ class TopKRouter(Router):
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
+
+        slime_routing_replay = get_slime_routing_replay()
+        if slime_routing_replay is not None:
+            slime_routing_replay.register_routing_replay(self)
 
     def _maintain_float32_expert_bias(self):
         """

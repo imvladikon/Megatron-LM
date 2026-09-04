@@ -19,6 +19,18 @@ class _FakeTPGroup:
         return 1
 
 
+class _IdentityView(torch.autograd.Function):
+    """Mirror TP gather's custom-autograd view contract at world size one."""
+
+    @staticmethod
+    def forward(ctx, value):
+        return value.view_as(value)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return gradient
+
+
 def test_vocab_parallel_cross_entropy_uses_explicit_tp_group(monkeypatch):
     tp_group = _FakeTPGroup()
     all_reduce_groups = []
@@ -45,6 +57,26 @@ def test_vocab_parallel_cross_entropy_uses_explicit_tp_group(monkeypatch):
 
     torch.testing.assert_close(output, expected_output)
     assert all_reduce_groups == [tp_group, tp_group, tp_group]
+
+
+def test_vocab_parallel_cross_entropy_accepts_fp32_custom_function_view(monkeypatch):
+    tp_group = _FakeTPGroup()
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, op=None, group=None: tensor)
+
+    base_logits = torch.tensor(
+        [[1.0, 2.0, 3.0], [0.5, -0.5, 1.0]], requires_grad=True
+    )
+    logits_view = _IdentityView.apply(base_logits)
+    target = torch.tensor([2, 0])
+    expected_logits = base_logits.detach().clone().requires_grad_(True)
+
+    output = vocab_parallel_cross_entropy(logits_view, target, tp_group=tp_group)
+    expected = torch.nn.functional.cross_entropy(expected_logits, target, reduction="none")
+    output.sum().backward()
+    expected.sum().backward()
+
+    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(base_logits.grad, expected_logits.grad)
 
 
 def test_language_module_unfused_loss_passes_tp_group(monkeypatch):

@@ -13,6 +13,7 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -50,6 +51,17 @@ def _make_mhc_layer_spec(**kwargs):
     from megatron.core.transformer.hyper_connection import HyperConnectionModule
 
     layer_spec = get_gpt_layer_with_transformer_engine_spec(**kwargs)
+    layer_spec.module = HyperConnectionTransformerLayer
+    layer_spec.submodules.self_attention_hyper_connection = HyperConnectionModule
+    layer_spec.submodules.mlp_hyper_connection = HyperConnectionModule
+    return layer_spec
+
+
+def _make_local_mhc_layer_spec(**kwargs):
+    """Build an mHC layer spec without requiring Transformer Engine."""
+    from megatron.core.transformer.hyper_connection import HyperConnectionModule
+
+    layer_spec = get_gpt_layer_local_spec(**kwargs)
     layer_spec.module = HyperConnectionTransformerLayer
     layer_spec.submodules.self_attention_hyper_connection = HyperConnectionModule
     layer_spec.submodules.mlp_hyper_connection = HyperConnectionModule
@@ -576,6 +588,38 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         )
         layer.cuda()
         return layer, config
+
+    def test_moe_forward_and_backward(self):
+        """The standard GPT mHC layer composes with a MoE MLP."""
+        config = _make_mhc_config(
+            hidden_size=32,
+            num_streams=4,
+            num_layers=1,
+            ffn_hidden_size=64,
+            moe_ffn_hidden_size=64,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+            add_bias_linear=False,
+            bias_dropout_fusion=False,
+        )
+        layer_spec = _make_local_mhc_layer_spec(
+            num_experts=4,
+            moe_grouped_gemm=False,
+            normalization="RMSNorm",
+        )
+        layer = HyperConnectionTransformerLayer(config, layer_spec.submodules).cuda()
+        hidden_states = torch.randn(8, 1, 4 * 32, device="cuda", requires_grad=True)
+        attention_mask = torch.ones((1, 1, 8, 8), dtype=bool, device="cuda")
+
+        output, _ = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        output.square().mean().backward()
+
+        assert output.shape == hidden_states.shape
+        assert hidden_states.grad is not None
+        assert layer.self_attention_hyper_connection.mapping_proj.weight.grad is not None
+        assert layer.mlp_hyper_connection.mapping_proj.weight.grad is not None
 
     def test_forward_with_hyper_connection_recompute(self):
         """
