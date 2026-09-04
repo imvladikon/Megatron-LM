@@ -2,8 +2,10 @@
 
 import copy
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Iterator, Optional, Tuple, Union
 
 import torch
 
@@ -32,6 +34,27 @@ try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
     hadamard_transform = None
+
+
+_DSA_INDEX_SHARE_STATE: ContextVar[
+    Optional[tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]]
+] = ContextVar("dsa_index_share_state", default=None)
+
+
+@contextmanager
+def dsa_index_share_context() -> Iterator[None]:
+    """Use fresh DSA index-share state for one checkpoint chunk invocation.
+
+    Full activation recompute invokes a chunk once under ``no_grad`` and again
+    during backward with detached tensor inputs. Tensor attributes therefore
+    cannot safely carry cross-layer indices into replay. A context local to the
+    chunk works in both invocations and cannot leak into another microbatch.
+    """
+    token = _DSA_INDEX_SHARE_STATE.set(({}, {}))
+    try:
+        yield
+    finally:
+        _DSA_INDEX_SHARE_STATE.reset(token)
 
 
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
@@ -1703,6 +1726,9 @@ class DSAttention(MegatronModule):
         attention_mask: Optional[torch.Tensor] = None,
     ) -> dict[int, torch.Tensor]:
         """Return the per-forward top-k holder for DSA index sharing."""
+        state = _DSA_INDEX_SHARE_STATE.get()
+        if state is not None:
+            return state[0]
         carrier = self._get_index_share_carrier(packed_seq_params, attention_mask)
         holder = getattr(carrier, self._HOLDER_ATTR, None)
         if holder is None:
@@ -1716,6 +1742,9 @@ class DSAttention(MegatronModule):
         attention_mask: Optional[torch.Tensor] = None,
     ) -> dict[int, torch.Tensor]:
         """Return the optional per-forward top-k length holder."""
+        state = _DSA_INDEX_SHARE_STATE.get()
+        if state is not None:
+            return state[1]
         carrier = self._get_index_share_carrier(packed_seq_params, attention_mask)
         holder = getattr(carrier, self._LENGTH_HOLDER_ATTR, None)
         if holder is None:
