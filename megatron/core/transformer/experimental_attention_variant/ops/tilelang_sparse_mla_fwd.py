@@ -228,10 +228,23 @@ def sparse_mla_fwd(  # pragma: no cover
 
 
 def sparse_mla_fwd_interface(
-    q, kv, indices, sm_scale=None, d_v=512, block_I=64, num_stages=2, threads=256
+    q, kv, indices, sm_scale=None, d_v=512, block_I=None, num_stages=2, threads=None
 ):
-    """Run sparse-MLA forward kernel and return (out, lse)."""
+    """Run sparse-MLA forward kernel and return (out, lse).
+
+    The smaller launch configuration is useful on devices such as A100 whose
+    opt-in dynamic shared-memory limit is below the default kernel's request.
+    Explicit arguments take precedence over the environment.
+    """
     require_tilelang()
+    if block_I is None:
+        block_I = _env_int("MCORE_DSA_TILELANG_FWD_BLOCK_I", 64)
+    if threads is None:
+        threads = _env_int("MCORE_DSA_TILELANG_FWD_THREADS", 256)
+    if block_I <= 0 or block_I & (block_I - 1):
+        raise ValueError(f"block_I must be a positive power of two, got {block_I}")
+    if threads <= 0 or threads > 1024 or threads % 32:
+        raise ValueError(f"threads must be a positive warp multiple no greater than 1024, got {threads}")
     seq_bucket = _env_int("MCORE_DSA_TILELANG_SEQ_BUCKET", 256)
     topk_bucket = _env_int("MCORE_DSA_TILELANG_TOPK_BUCKET", block_I)
 
