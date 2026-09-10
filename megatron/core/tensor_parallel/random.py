@@ -764,7 +764,7 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         *args: Unpack[_Ts],
     ) -> _R:
         """Forward pass."""
-        if checkpoint_without_output_obj.fp8:
+        if HAVE_TE and checkpoint_without_output_obj.fp8:
             fp8 = FP8GlobalStateManager.is_fp8_enabled()
             ctx.fp8 = fp8
             ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8 else None
@@ -944,7 +944,7 @@ class CheckpointWithoutOutput(object):
         with _fork_rng():
             _set_all_rng_states(*self.rng_states)
 
-            if self.fp8:
+            if HAVE_TE and self.fp8:
                 recompute_ctx = activation_recompute_forward(
                     activation_recompute=True, recompute_phase=True
                 )

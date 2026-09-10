@@ -2,8 +2,26 @@
 import pytest
 import torch
 
+import megatron.core.transformer.moe.moe_utils as moe_utils
 from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
+
+
+def test_slime_routing_replay_is_optional(monkeypatch):
+    monkeypatch.setattr(moe_utils, "_SLIME_ROUTING_REPLAY", None)
+    monkeypatch.setattr(moe_utils, "_SLIME_ROUTING_REPLAY_RESOLVED", True)
+    monkeypatch.delenv("ENABLE_ROUTING_REPLAY", raising=False)
+
+    assert moe_utils.get_slime_routing_replay() is None
+
+
+def test_missing_slime_fails_when_external_replay_is_enabled(monkeypatch):
+    monkeypatch.setattr(moe_utils, "_SLIME_ROUTING_REPLAY", None)
+    monkeypatch.setattr(moe_utils, "_SLIME_ROUTING_REPLAY_RESOLVED", True)
+    monkeypatch.setenv("ENABLE_ROUTING_REPLAY", "1")
+
+    with pytest.raises(RuntimeError, match="requires THUDM/slime"):
+        moe_utils.get_slime_routing_replay()
 
 
 def setup_function():

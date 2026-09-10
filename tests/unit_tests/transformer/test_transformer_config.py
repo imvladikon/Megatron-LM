@@ -84,6 +84,18 @@ def test_explicit_mhc_fused_backend_requires_fused_mhc():
         )
 
 
+def test_glm_mhc_rms_rejects_incompatible_fused_path():
+    with pytest.raises(ValueError, match="does not implement"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            use_fused_mhc=True,
+            mhc_rms_epsilon_inside_sqrt=True,
+        )
+
+
 def test_gdp_num_householder_defaults_to_three():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 

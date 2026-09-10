@@ -11,16 +11,185 @@ Tests the following functionality:
 5. TransformerConfig 'mhc' in recompute_modules option
 """
 
+import copy
+
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutputManager,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    eager_h_post_bda,
+    native_proj_rms,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_native_proj_rms_supports_rmsnorm_epsilon_contract():
+    """Checkpoints can select epsilon inside sqrt without changing the default."""
+    x = torch.tensor([[0.0, 0.0], [3.0, 4.0]], dtype=torch.float32)
+    weight = torch.eye(2, dtype=torch.float32)
+    eps = 1e-6
+
+    projection, inside = native_proj_rms(x, weight, eps, True)
+    _, outside = native_proj_rms(x, weight, eps, False)
+
+    rms_scale = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+    torch.testing.assert_close(projection, x * rms_scale, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(inside, torch.ones_like(rms_scale))
+    torch.testing.assert_close(
+        outside,
+        torch.reciprocal(torch.sqrt(x.square().mean(-1, keepdim=True)) + eps),
+    )
+    assert not torch.equal(inside, outside)
+
+
+def test_glm_mhc_mapping_matches_bf16_reference_forward_backward():
+    """GLM stores fn in BF16 but evaluates the complete mapping in FP32."""
+    torch.manual_seed(19)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        use_cpu_initialization=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        layernorm_epsilon=1e-5,
+        enable_mhc_connections=True,
+        mhc_num_residual_streams=4,
+        mhc_sinkhorn_iterations=20,
+        mhc_rms_epsilon_inside_sqrt=True,
+        mhc_mapping_proj_fp32=False,
+    )
+    module = HyperConnectionModule(config=config, layer_number=1)
+    assert module.mapping_proj.weight.dtype == torch.bfloat16
+    assert module.bias.dtype == torch.float32
+    assert module.alpha_pre.dtype == torch.float32
+
+    x_actual = (torch.randn(3, 2, 32, dtype=torch.bfloat16) * 1e-3).requires_grad_(True)
+    x_reference = x_actual.detach().clone().requires_grad_(True)
+    fn = module.mapping_proj.weight.detach().clone().requires_grad_(True)
+    base = module.bias.detach().clone().requires_grad_(True)
+    scales = [
+        value.detach().clone().requires_grad_(True)
+        for value in (module.alpha_pre, module.alpha_post, module.alpha_res)
+    ]
+
+    actual = module(x_actual)
+
+    flat = x_reference.float()
+    normalized = flat * torch.rsqrt(
+        flat.square().mean(-1, keepdim=True) + config.layernorm_epsilon
+    )
+    projected = F.linear(normalized, fn.float())
+    pre_w, post_w, comb_w = projected.split([4, 4, 16], dim=-1)
+    pre_b, post_b, comb_b = base.split([4, 4, 16])
+    pre = torch.sigmoid(pre_w * scales[0] + pre_b) + 1e-6
+    post = 2 * torch.sigmoid(post_w * scales[1] + post_b)
+    comb = torch.softmax(
+        comb_w.view(3, 2, 4, 4) * scales[2] + comb_b.view(4, 4), dim=-1
+    ) + 1e-6
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + 1e-6)
+    for _ in range(19):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + 1e-6)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + 1e-6)
+    collapsed = (
+        pre.unsqueeze(-1) * x_reference.view(3, 2, 4, 8)
+    ).sum(dim=2)
+    reference = (
+        collapsed.to(torch.bfloat16),
+        comb.to(torch.bfloat16),
+        post.to(torch.bfloat16),
+    )
+
+    for actual_tensor, reference_tensor in zip(actual, reference):
+        torch.testing.assert_close(actual_tensor, reference_tensor, atol=0.0, rtol=0.0)
+
+    sum(t.float().square().sum() for t in actual).backward()
+    sum(t.float().square().sum() for t in reference).backward()
+    torch.testing.assert_close(x_actual.grad, x_reference.grad, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(module.mapping_proj.weight.grad, fn.grad, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(module.bias.grad, base.grad, atol=1e-6, rtol=1e-6)
+    for parameter, reference_scale in zip(
+        (module.alpha_pre, module.alpha_post, module.alpha_res), scales
+    ):
+        torch.testing.assert_close(parameter.grad, reference_scale.grad, atol=1e-6, rtol=1e-6)
+
+
+def test_glm_mhc_final_stream_update_matches_eager_bf16_reference():
+    torch.manual_seed(29)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        use_cpu_initialization=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        layernorm_epsilon=1e-5,
+        hidden_dropout=0.0,
+        enable_mhc_connections=True,
+        mhc_num_residual_streams=4,
+        mhc_sinkhorn_iterations=20,
+        mhc_rms_epsilon_inside_sqrt=True,
+        mhc_mapping_proj_fp32=False,
+    )
+    module = HyperConnectionModule(config=config, layer_number=1)
+    reference_module = copy.deepcopy(module)
+    assert module._h_post_bda_op is eager_h_post_bda
+
+    hidden_actual = (torch.randn(3, 2, 32, dtype=torch.bfloat16) * 1e-3).requires_grad_(True)
+    hidden_reference = hidden_actual.detach().clone().requires_grad_(True)
+    update_actual = torch.randn(3, 2, 8, dtype=torch.bfloat16, requires_grad=True)
+    update_reference = update_actual.detach().clone().requires_grad_(True)
+
+    _, h_res, h_post, residual = module(hidden_actual, return_residual=True)
+    actual = module.fused_h_res_h_post_bda(
+        h_res,
+        residual,
+        h_post,
+        (update_actual, None),
+        dropout_prob=0.0,
+        training=True,
+        fused=False,
+    )
+
+    _, ref_h_res, ref_h_post, ref_residual = reference_module(
+        hidden_reference, return_residual=True
+    )
+    s, b, _ = ref_residual.shape
+    reference = (
+        ref_h_post.unsqueeze(-1) * update_reference.unsqueeze(2)
+        + torch.matmul(
+            ref_h_res.transpose(-1, -2),
+            ref_residual.view(s, b, 4, config.hidden_size),
+        )
+    ).view(s, b, -1)
+
+    torch.testing.assert_close(actual, reference, atol=0.0, rtol=0.0)
+    actual.float().square().sum().backward()
+    reference.float().square().sum().backward()
+    torch.testing.assert_close(hidden_actual.grad, hidden_reference.grad, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(update_actual.grad, update_reference.grad, atol=0.0, rtol=0.0)
+    for actual_parameter, reference_parameter in zip(
+        module.parameters(), reference_module.parameters(), strict=True
+    ):
+        torch.testing.assert_close(
+            actual_parameter.grad, reference_parameter.grad, atol=0.0, rtol=0.0
+        )
+
+
+def test_glm_mhc_module_rejects_fused_mode_after_config_mutation():
+    config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=2)
+    config.enable_mhc_connections = True
+    config.mhc_rms_epsilon_inside_sqrt = True
+    config.use_fused_mhc = True
+    with pytest.raises(ValueError, match="does not implement"):
+        HyperConnectionModule(config=config, layer_number=1)
 
 
 class TestHyperConnectionModuleCheckpoint:

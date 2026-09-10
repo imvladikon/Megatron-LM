@@ -22,7 +22,17 @@ class VocabParallelCrossEntropy:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calculates logits_max."""
 
-        vocab_parallel_logits = vocab_parallel_logits.float()
+        # The loss implementation mutates this working buffer in-place below.
+        # ``Tensor.float()`` allocates for BF16/FP16, but is an identity for an
+        # already-FP32 tensor.  If that tensor is a view returned by a custom
+        # autograd Function (for example the TP gather used by GPTModel when
+        # ``parallel_output=False``), PyTorch 2.13 correctly rejects the later
+        # in-place writes.  Clone only the FP32 case: lower-precision inputs
+        # already receive independent storage from the cast.
+        if vocab_parallel_logits.dtype == torch.float32:
+            vocab_parallel_logits = vocab_parallel_logits.clone()
+        else:
+            vocab_parallel_logits = vocab_parallel_logits.float()
         # Maximum value along vocab dimension across all GPUs.
         logits_max = torch.max(vocab_parallel_logits, dim=-1)[0]
 

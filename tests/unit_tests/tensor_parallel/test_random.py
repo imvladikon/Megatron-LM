@@ -239,6 +239,40 @@ def test_checkpoint_without_output():
     assert torch.equal(input1.grad, input2.grad)
 
 
+def test_checkpoint_without_output_without_transformer_engine(monkeypatch):
+    import megatron.core.tensor_parallel.random as random_module
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("Transformer Engine must not be used when it is unavailable")
+
+    monkeypatch.setattr(random_module, "HAVE_TE", False)
+    monkeypatch.setattr(random_module, "activation_recompute_forward", fail_if_called, raising=False)
+    monkeypatch.setattr(random_module, "fp8_autocast", fail_if_called, raising=False)
+
+    def checkpoint_forward(input_):
+        checkpoint = CheckpointWithoutOutput()
+        hidden = checkpoint.checkpoint(torch.nn.functional.gelu, input_)
+        output = hidden.square()
+        checkpoint.discard_output_and_register_recompute(output)
+        return output
+
+    Utils.initialize_model_parallel()
+    try:
+        reference_input = torch.randn((4, 4), requires_grad=True)
+        checkpoint_input = reference_input.detach().clone().requires_grad_(True)
+
+        reference_output = torch.nn.functional.gelu(reference_input).square()
+        checkpoint_output = checkpoint_forward(checkpoint_input)
+        assert torch.equal(reference_output, checkpoint_output)
+
+        gradient = torch.randn_like(reference_output)
+        reference_output.backward(gradient)
+        checkpoint_output.backward(gradient)
+        assert torch.allclose(reference_input.grad, checkpoint_input.grad)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 class _ViewSavingLinear(torch.autograd.Function):
     """Saves view tensors in forward to mimic TE GroupedLinear-style backward inputs."""
 
