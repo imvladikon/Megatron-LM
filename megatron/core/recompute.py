@@ -20,6 +20,55 @@ else:
     te_checkpoint = None
 
 
+def _build_dsa_index_share_recompute_chunks(
+    layers, target_chunk_size: int, skip_topk_offset: int, topk_freq: int
+) -> List[Tuple[int, int]]:
+    """Build chunks that never separate a DSA source from its consumers."""
+    if target_chunk_size < 1:
+        raise ValueError(f"target_chunk_size must be positive, got {target_chunk_size}.")
+
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        is_dsa_skip_topk_layer,
+        source_dsa_compute_layer,
+    )
+
+    atomic_groups: List[Tuple[int, int]] = []
+    start = 0
+    while start < len(layers):
+        source_layer = int(layers[start].layer_number)
+        if is_dsa_skip_topk_layer(source_layer, skip_topk_offset, topk_freq):
+            expected_source = source_dsa_compute_layer(
+                source_layer, skip_topk_offset, topk_freq
+            )
+            raise RuntimeError(
+                "DSA index-share recompute chunk begins with a consumer layer: "
+                f"layer={source_layer}, source={expected_source}. Keep each source and all "
+                "of its consumers on the same pipeline stage."
+            )
+
+        end = start + 1
+        while end < len(layers):
+            layer_number = int(layers[end].layer_number)
+            if not is_dsa_skip_topk_layer(layer_number, skip_topk_offset, topk_freq):
+                break
+            if (
+                source_dsa_compute_layer(layer_number, skip_topk_offset, topk_freq)
+                != source_layer
+            ):
+                break
+            end += 1
+        atomic_groups.append((start, end))
+        start = end
+
+    chunks: List[Tuple[int, int]] = []
+    for group_start, group_end in atomic_groups:
+        if not chunks or group_end - chunks[-1][0] > target_chunk_size:
+            chunks.append((group_start, group_end))
+        else:
+            chunks[-1] = (chunks[-1][0], group_end)
+    return chunks
+
+
 def checkpointed_forward(
     self: MegatronModule,
     hidden_states: Tensor,
@@ -55,6 +104,15 @@ def checkpointed_forward(
     if extract_layer_indices is None:
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
+    dsa_index_share = (
+        getattr(self.config, "experimental_attention_variant", None) == "dsa"
+        and int(getattr(self.config, "dsa_indexer_topk_freq", 1) or 1) > 1
+    )
+    if dsa_index_share and self.config.recompute_method != "uniform":
+        raise ValueError(
+            "Full activation recompute with DSA index sharing requires "
+            "recompute_method='uniform' so source and consumer layers can be replayed together."
+        )
 
     # Wrap non-dual RoPE to tuple to unify custom_forward interface.
     is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
@@ -141,6 +199,12 @@ def checkpointed_forward(
                     hidden_states = cp_layout_state.finalize_layer(index, hidden_states)
             return hidden_states, context
 
+        if dsa_index_share:
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                dsa_index_share_context,
+            )
+
+            return dsa_index_share_context()(custom_forward)
         return custom_forward
 
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
@@ -178,13 +242,28 @@ def checkpointed_forward(
     if self.config.recompute_method == 'uniform':
         # Uniformly divide the total number of layers and checkpoint
         # the input activation of each divided chunk.
-        layer_idx = 0
-        while layer_idx < self.num_layers_per_pipeline_rank:
-            chunk_end = min(
-                layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
+        if dsa_index_share:
+            chunks = _build_dsa_index_share_recompute_chunks(
+                self.layers,
+                self.config.recompute_num_layers,
+                int(getattr(self.config, "dsa_indexer_skip_topk_offset", 0) or 0),
+                int(self.config.dsa_indexer_topk_freq),
             )
-            chunk_runner(layer_idx, chunk_end, True)
-            layer_idx += self.config.recompute_num_layers
+        else:
+            chunks = [
+                (
+                    layer_idx,
+                    min(
+                        layer_idx + self.config.recompute_num_layers,
+                        self.num_layers_per_pipeline_rank,
+                    ),
+                )
+                for layer_idx in range(
+                    0, self.num_layers_per_pipeline_rank, self.config.recompute_num_layers
+                )
+            ]
+        for chunk_start, chunk_end in chunks:
+            chunk_runner(chunk_start, chunk_end, True)
     elif self.config.recompute_method == 'block':
         # Checkpoint the input activation of only a set number of individual
         # layers and skip the rest. Need at least one input tensor with

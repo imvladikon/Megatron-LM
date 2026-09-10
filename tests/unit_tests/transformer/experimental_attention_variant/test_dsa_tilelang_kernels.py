@@ -20,6 +20,7 @@ from megatron.core.transformer.experimental_attention_variant.ops import (
     tilelang_indexer_fwd,
     tilelang_indexer_loss,
     tilelang_sparse_mla_bwd,
+    tilelang_sparse_mla_fwd,
     tilelang_utils,
 )
 
@@ -452,6 +453,68 @@ def test_tilelang_kernel_helper_caches_and_env_parsing(monkeypatch):
     assert not tilelang_dsa._is_supported_sparse_mla_head_count(48)
     assert not tilelang_dsa._is_supported_sparse_mla_head_count(192)
     assert not tilelang_dsa._is_supported_sparse_mla_head_count(96, kv_group=2)
+
+
+def test_sparse_mla_forward_launch_config_reads_environment(monkeypatch):
+    captured = {}
+
+    def fake_get_fwd_kernel(**kwargs):
+        captured.update(kwargs)
+
+        def fake_kernel(q, _kv, _indices):
+            return (
+                torch.zeros((*q.shape[:-1], 512), dtype=q.dtype),
+                torch.zeros(q.shape[:-1], dtype=torch.float32),
+            )
+
+        return fake_kernel
+
+    monkeypatch.setattr(tilelang_sparse_mla_fwd, "require_tilelang", lambda: None)
+    monkeypatch.setattr(
+        tilelang_sparse_mla_fwd, "_get_sparse_mla_fwd_kernel", fake_get_fwd_kernel
+    )
+    monkeypatch.setenv("MCORE_DSA_TILELANG_FWD_BLOCK_I", "32")
+    monkeypatch.setenv("MCORE_DSA_TILELANG_FWD_THREADS", "128")
+
+    q = torch.zeros((1, 2, 32, 576), dtype=torch.bfloat16)
+    kv = torch.zeros((1, 2, 1, 576), dtype=torch.bfloat16)
+    indices = torch.zeros((1, 2, 1, 32), dtype=torch.int32)
+    tilelang_sparse_mla_fwd.sparse_mla_fwd_interface(q, kv, indices)
+
+    assert captured["block_I"] == 32
+    assert captured["threads"] == 128
+
+
+def test_sparse_mla_forward_explicit_launch_config_overrides_environment(monkeypatch):
+    captured = {}
+
+    def fake_get_fwd_kernel(**kwargs):
+        captured.update(kwargs)
+
+        def fake_kernel(q, _kv, _indices):
+            return (
+                torch.zeros((*q.shape[:-1], 512), dtype=q.dtype),
+                torch.zeros(q.shape[:-1], dtype=torch.float32),
+            )
+
+        return fake_kernel
+
+    monkeypatch.setattr(tilelang_sparse_mla_fwd, "require_tilelang", lambda: None)
+    monkeypatch.setattr(
+        tilelang_sparse_mla_fwd, "_get_sparse_mla_fwd_kernel", fake_get_fwd_kernel
+    )
+    monkeypatch.setenv("MCORE_DSA_TILELANG_FWD_BLOCK_I", "16")
+    monkeypatch.setenv("MCORE_DSA_TILELANG_FWD_THREADS", "64")
+
+    q = torch.zeros((1, 2, 32, 576), dtype=torch.bfloat16)
+    kv = torch.zeros((1, 2, 1, 576), dtype=torch.bfloat16)
+    indices = torch.zeros((1, 2, 1, 64), dtype=torch.int32)
+    tilelang_sparse_mla_fwd.sparse_mla_fwd_interface(
+        q, kv, indices, block_I=64, threads=256
+    )
+
+    assert captured["block_I"] == 64
+    assert captured["threads"] == 256
 
 
 def test_sparse_mla_canonicalizes_size_one_batch_stride_without_copy():
