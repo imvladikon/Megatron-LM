@@ -61,6 +61,7 @@ class HybridStackSubmodules:
 
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
+    kda_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
     mla_layer: Union[ModuleSpec, type] = IdentityOp
@@ -167,7 +168,7 @@ class HybridStack(MegatronModule):
 
         self.layer_config_list = layer_config_list
         self._has_linear_layer_with_chunkwise_cp = self.cp_group.size() > 1 and any(
-            type(layer_config) is layer_utils.MambaLayerConfig
+            type(layer_config) in (layer_utils.MambaLayerConfig, layer_utils.KDALayerConfig)
             and layer_config.linear_cp_mode == "chunkwise"
             for layer_config in self.layer_config_list
         )
@@ -286,6 +287,17 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
+                elif type(layer_config) is layer_utils.KDALayerConfig:
+                    layer = build_module(
+                        submodules.kda_layer,
+                        config=layer_config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        # Set to False as we do not want to change offset.
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
                 else:
                     raise ValueError(
                         f"Unexpected hybrid layer config type: {type(layer_config).__name__}"
@@ -309,7 +321,12 @@ class HybridStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
-        if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
+        if (
+            self.config.enable_mhc_connections
+            and self.config.mhc_learned_output_contract
+            and self.post_process
+            and not self.is_mtp_layer
+        ):
             hc_mult = self.config.mhc_num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
             self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
@@ -635,14 +652,19 @@ class HybridStack(MegatronModule):
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.mhc_num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            if self.config.mhc_learned_output_contract:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.mhc_num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
+            else:
+                hidden_states = HyperConnectionModule.output_contract(
+                    hidden_states, self.config.mhc_num_residual_streams
+                )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

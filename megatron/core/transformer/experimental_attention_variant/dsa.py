@@ -24,6 +24,7 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_kpool import select_kpool_tokens
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1293,6 +1294,7 @@ class DSAIndexer(MegatronModule):
         self.index_n_heads = self.config.dsa_indexer_n_heads
         self.index_head_dim = self.config.dsa_indexer_head_dim
         self.index_topk = self.config.dsa_indexer_topk
+        self.index_kpool = getattr(self.config, "dsa_indexer_kpool", 1)
 
         self.softmax_scale: float = self.index_head_dim**-0.5
 
@@ -1301,7 +1303,9 @@ class DSAIndexer(MegatronModule):
         self.pg_collection = pg_collection
 
         # Initialize Position Embedding.
-        if self.config.rope_type == 'rope':
+        if self.qk_pos_emb_head_dim == 0:
+            self.rotary_pos_emb = None
+        elif self.config.rope_type == 'rope':
             self.rotary_pos_emb = RotaryEmbedding(
                 self.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
@@ -1372,6 +1376,16 @@ class DSAIndexer(MegatronModule):
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
         )
+        if self.index_kpool > 1:
+            # Released Flash checkpoints store both tensors in the projection
+            # dtype (BF16), including APE. Their arithmetic is handled by KPool.
+            weight = self.linear_wk.weight
+            self.index_kpool_compress_ape = torch.nn.Parameter(
+                torch.zeros(self.index_kpool, self.index_head_dim, device=weight.device, dtype=weight.dtype)
+            )
+            self.index_kpool_compress_gate = torch.nn.Parameter(
+                torch.ones(self.index_head_dim, self.hidden_size, device=weight.device, dtype=weight.dtype)
+            )
         # Indexer projections are duplicated across tensor-parallel ranks, so their gradients
         # should be averaged during final gradient synchronization.
         for param in self.parameters():
@@ -1385,6 +1399,8 @@ class DSAIndexer(MegatronModule):
         cu_seqlens: Optional[torch.Tensor] = None,
     ):
         """Apply RoPE to the input tensor."""
+        if self.qk_pos_emb_head_dim == 0:
+            return x
         # x_pe   [seqlen, batch, *, qk_pos_emb_head_dim]
         # x_nope [seqlen, batch, *, index_head_dim - qk_pos_emb_head_dim]
         # To align with DeepSeek's implementation,
@@ -1417,21 +1433,43 @@ class DSAIndexer(MegatronModule):
 
     def forward_before_topk(
         self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """All computations before topk."""
+        if self.index_kpool > 1:
+            raise ValueError("KPool requires forward_kpool_projections and pool-wise selection")
+        return self._forward_projections(x, qr, packed_seq_params, kpool=False)
+
+    @torch.no_grad()
+    def forward_kpool_projections(
+        self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return Q, K, unscaled head weights and token-aligned compression gates.
+
+        Gates are returned to the caller; no activation or autograd graph is
+        retained on the module between microbatches.
+        """
+        if self.index_kpool <= 1:
+            raise ValueError("KPool projections require dsa_indexer_kpool > 1")
+        if getattr(self.config, "fp8", None) or getattr(self.config, "fp4", None):
+            raise NotImplementedError("KPool projections currently require a non-quantized execution config")
+        return self._forward_projections(x, qr, packed_seq_params, kpool=True)
+
+    def _forward_projections(self, x, qr, packed_seq_params, *, kpool):
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
 
         # =========================================
         # Prepare RoPE params
         # =========================================
-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            None, None, x, self.config, packed_seq_params
-        )
-        if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
-            mscale = 1.0
-        else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+        rotary_pos_emb = None
+        mscale = 1.0
+        if self.rotary_pos_emb is not None:
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                None, None, x, self.config, packed_seq_params
+            )
+            if self.config.rope_type == "rope":
+                rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            else:
+                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         if packed_seq:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
         else:
@@ -1487,6 +1525,9 @@ class DSAIndexer(MegatronModule):
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
         weights, _ = self.linear_weights_proj(x)
+        if kpool:
+            gates = torch.nn.functional.linear(x, self.index_kpool_compress_gate)
+            return q, k, weights, gates
         weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
 
         return q, k, weights
@@ -1545,6 +1586,23 @@ class DSAIndexer(MegatronModule):
         Returns:
             topk_indices: Top-k indices for sparse attention [batch, seqlen, index_topk].
         """
+        if self.index_kpool > 1:
+            if self.pg_collection.cp.size() > 1:
+                raise ValueError("Use DSAttention for KPool with context parallelism")
+            q, k, weights, gates = self.forward_kpool_projections(x, qr, packed_seq_params)
+            physical_cu = logical_cu = None
+            if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+                _, physical_cu = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
+                logical_cu = packed_seq_params.cu_seqlens_kv
+            return select_kpool_tokens(
+                q, k, weights, gates, self.index_kpool_compress_ape,
+                index_topk=self.index_topk, pool_size=self.index_kpool,
+                always_select_tail=self.config.dsa_indexer_kpool_always_select_tail,
+                workspace_bytes=self.config.dsa_indexer_kpool_workspace_bytes,
+                mask=mask, cu_seqlens_kv=physical_cu,
+                sequence_lengths=logical_cu.diff() if logical_cu is not None else None,
+                use_relu=self.config.dsa_indexer_scoring_relu,
+            )
         _, topk_indices = self.forward_with_scores(x, qr, mask, packed_seq_params)
         return topk_indices
 
@@ -2128,6 +2186,10 @@ class DSAttention(MegatronModule):
         topk_indices = None
         topk_length = None
         q = k = weights = None
+        gate_scores = None
+        is_kpool = getattr(self.config, "dsa_indexer_kpool", 1) > 1
+        if is_kpool and indexer_loss_coeff:
+            raise NotImplementedError("KPool does not implement token-wise indexer KL loss")
         local_packed_cp_query_start = 0
         local_packed_cp_query_len = sq
         if sequence_parallel_query_is_local:
@@ -2153,7 +2215,10 @@ class DSAttention(MegatronModule):
         else:
             assert self.indexer is not None
             with torch.enable_grad() if use_indexer_loss else torch.no_grad():
-                q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+                if is_kpool:
+                    q, k, weights, gate_scores = self.indexer.forward_kpool_projections(x, qr, packed_seq_params)
+                else:
+                    q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
                 if cp_size > 1 and k.size(0) in local_cp_kv_lens:
                     if kv_reorder_idx is None:
                         kv_reorder_idx = _build_kv_reorder_idx(k.size(0))
@@ -2164,6 +2229,9 @@ class DSAttention(MegatronModule):
                             f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
                         )
                     k = k.index_select(0, kv_reorder_idx)
+                    if gate_scores is not None:
+                        gate_scores = gather_from_sequence_parallel_region(gate_scores, group=cp_group)
+                        gate_scores = gate_scores.index_select(0, kv_reorder_idx)
                 if sequence_parallel_tp and q.size(0) != sq:
                     if (
                         q.size(0) != sequence_parallel_tp_full_rows
@@ -2210,7 +2278,7 @@ class DSAttention(MegatronModule):
             )
 
         fused_output = None
-        if use_fused_kernels and not self.index_share:
+        if use_fused_kernels and not self.index_share and not is_kpool:
             assert q is not None and k is not None and weights is not None
             fused_output = dsa_kernels.run_fused_dsa_attention(
                 config=self.config,
@@ -2259,7 +2327,7 @@ class DSAttention(MegatronModule):
             return _normalize_dsattention_output_rank(output, x.ndim)
 
         fused_bounds = None
-        if use_fused_kernels and computes_topk:
+        if use_fused_kernels and computes_topk and not is_kpool:
             assert q is not None
             fused_bounds = dsa_masking.build_fused_indexer_varlen_bounds(
                 sq=sq,
@@ -2347,7 +2415,24 @@ class DSAttention(MegatronModule):
             # ===================================
             # Get top-k indices
             # ===================================
-            if fused_bounds is not None:
+            if is_kpool:
+                logical_cu = packed_seq_params.cu_seqlens_kv if packed_thd else None
+                topk_indices = select_kpool_tokens(
+                    q, k, weights, gate_scores, self.indexer.index_kpool_compress_ape,
+                    index_topk=self.index_topk,
+                    pool_size=self.config.dsa_indexer_kpool,
+                    always_select_tail=self.config.dsa_indexer_kpool_always_select_tail,
+                    workspace_bytes=self.config.dsa_indexer_kpool_workspace_bytes,
+                    mask=float_mask,
+                    varlen_starts=varlen_starts, varlen_ends=varlen_ends,
+                    key_positions=key_positions,
+                    cu_seqlens_kv=cu_seqlens_kv if packed_thd else None,
+                    sequence_lengths=logical_cu.diff() if logical_cu is not None else None,
+                    query_valid_rows=query_valid_rows,
+                    use_relu=self.config.dsa_indexer_scoring_relu,
+                )
+                del gate_scores
+            elif fused_bounds is not None:
                 starts_i32, ends_i32 = fused_bounds
                 block_size = int(getattr(self, "fused_indexer_block_size", 8192))
                 fused_topk = dsa_kernels.run_fused_qk_topk(

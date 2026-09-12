@@ -786,6 +786,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
 
+        # Main-param construction orders native FP32 shards before the shards of
+        # FP16/BF16 parameters within each optimizer group. Buffer traversal can
+        # use a different dtype order, so checkpoint lookups must follow the
+        # final optimizer order, including for precision-aware optimizers.
+        self.model_param_group_index_map = {
+            param: (group_index, param_index)
+            for group_index, (fp32_params, float16_params) in enumerate(
+                zip(self.model_fp32_groups, self.model_float16_groups)
+            )
+            for param_index, param in enumerate(fp32_params + float16_params)
+        }
+
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
                 params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults

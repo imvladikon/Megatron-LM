@@ -343,6 +343,17 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk: Optional[int] = None
     """Number of top-k tokens to select in DSA indexer."""
 
+    dsa_indexer_kpool: int = 1
+    """Select compressed pools of this many tokens; 1 preserves token-wise DSA."""
+
+    dsa_indexer_kpool_always_select_tail: bool = False
+    """Append the query's incomplete causal pool as uncompressed token indices."""
+
+    dsa_indexer_kpool_workspace_bytes: int = 64 * 1024 * 1024
+    """Estimated score/compression scratch budget; excludes inputs, pooled keys,
+    final indices and backend-internal workspaces. KPool chunks queries and pools
+    to avoid a full sequence-by-pool score matrix."""
+
     dsa_indexer_topk_freq: int = 1
     """Frequency of DSA indexer top-k computation across layers.
     A value greater than 1 enables cross-layer top-k sharing."""
@@ -419,6 +430,27 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
+
+    kda_disable_fp8: bool = False
+    """Force KDA projections to BF16 even under FP8 training,
+    (KDA projections are BF16 in the checkpoint)."""
+
+    kda_safe_gate: bool = False
+    """Whether the KDA kernel should use bounded gate values."""
+
+    kda_lower_bound: Optional[float] = None
+    """Optional lower bound for KDA's bounded gate values."""
+
+    kda_two_stage_gates: bool = False
+    """Use low-rank f_b(f_a(x)) and g_b(g_a(x)) gates with a QKV-only input projection."""
+
+    gdn_pre_gated_delta_rule_fusion: bool = False
+    """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+
+    gdn_conv_pad_alignment: Optional[int] = None
+    """When set, pad packed GDN causal-conv inputs to this token alignment.
+    This is only valid without chunkwise CP: padding a chunk-local causal-conv input changes
+    the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
 
     ####################
     # initialization
@@ -1205,6 +1237,13 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
+    mhc_learned_output_contract: bool = True
+    """Use a learned projection to collapse the residual streams at HybridStack exit.
+
+    False selects the parameter-free mean used by GLM-5.3-Flash. The default
+    preserves the learned head and checkpoint schema of existing Hybrid models.
+    """
+
     mhc_rms_epsilon_inside_sqrt: bool = False
     """Apply the mHC projection RMS epsilon inside the square root.
 
@@ -1688,6 +1727,24 @@ class TransformerConfig(ModelParallelConfig):
             )
         elif self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+            if type(self.dsa_indexer_kpool) is not int or self.dsa_indexer_kpool < 1:
+                raise ValueError("dsa_indexer_kpool must be a positive integer")
+            if self.dsa_indexer_kpool > 1:
+                if (
+                    type(self.dsa_indexer_topk) is not int
+                    or self.dsa_indexer_topk < 1
+                    or self.dsa_indexer_topk % self.dsa_indexer_kpool
+                ):
+                    raise ValueError("KPool requires a positive top-k divisible by pool size")
+                if self.dsa_indexer_loss_coeff:
+                    raise NotImplementedError("KPool selection does not implement the token-wise indexer KL loss")
+                if self.fp8 or self.fp4:
+                    raise NotImplementedError("KPool projection quantization requires a separately qualified kernel path")
+                if (
+                    type(self.dsa_indexer_kpool_workspace_bytes) is not int
+                    or self.dsa_indexer_kpool_workspace_bytes < 1
+                ):
+                    raise ValueError("KPool workspace must be a positive byte count")
             if self.add_bias_linear:
                 raise ValueError(
                     "DSA uses AbsorbedMLASelfAttention, which requires add_bias_linear=False. "

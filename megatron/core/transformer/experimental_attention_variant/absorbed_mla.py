@@ -187,12 +187,18 @@ class AbsorbedMLASelfAttention(Attention):
         )
         self.qkv_up_checkpoint = None
 
-        mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
+        mscale = (
+            _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
+            if self.config.qk_pos_emb_head_dim > 0
+            else 1.0
+        )
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
         self.cache_mla_latents = self.config.cache_mla_latents
         assert not self.cache_mla_latents, "cache_mla_latents is not supported for AbsorbedMLA"
 
-        if self.config.rope_type == "rope":
+        if self.config.qk_pos_emb_head_dim == 0:
+            self.rotary_pos_emb = None
+        elif self.config.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
@@ -416,29 +422,29 @@ class AbsorbedMLASelfAttention(Attention):
         # =========================================
         # Prepare RoPE and seqlen related params
         # =========================================
-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            inference_context, None, hidden_states, self.config, packed_seq_params
-        )
-
         mscale = 1.0
+        rotary_pos_emb = None
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
-        else:
-            if self.config.apply_rope_fusion:
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
-                )
-                rotary_pos_emb = None
-                assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-                assert (
-                    fused_apply_mla_rope_for_q is not None
-                    and fused_apply_mla_rope_for_kv is not None
-                ), "Fused MLA RoPE apply is not imported successfully"
+        if self.rotary_pos_emb is not None:
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, None, hidden_states, self.config, packed_seq_params
+            )
+            if self.config.rope_type == "rope":
+                rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
             else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+                if self.config.apply_rope_fusion:
+                    rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                        rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
+                    )
+                    assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
+                    assert (
+                        fused_apply_mla_rope_for_q is not None
+                        and fused_apply_mla_rope_for_kv is not None
+                    ), "Fused MLA RoPE apply is not imported successfully"
+                else:
+                    rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:
@@ -505,7 +511,11 @@ class AbsorbedMLASelfAttention(Attention):
             kv_compressed, k_pos_emb = torch.split(
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
-            if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
+            if (
+                self.config.qk_pos_emb_head_dim > 0
+                and get_pg_size(self.tp_group) > 1
+                and self.config.sequence_parallel
+            ):
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
@@ -563,7 +573,12 @@ class AbsorbedMLASelfAttention(Attention):
 
             k_up_weight, _ = self._get_kv_up_weights()
 
-            if self.config.apply_rope_fusion:
+            if self.config.qk_pos_emb_head_dim == 0:
+                # NoPE has no rotary buffers or empty-dimension communication.
+                # Absorbing the key up-projection preserves QK^T exactly in
+                # real arithmetic: Q (K_latent W_K^T)^T = (Q W_K) K_latent^T.
+                q_absorbed = torch.einsum("...nd,ndk->...nk", q, k_up_weight).contiguous()
+            elif self.config.apply_rope_fusion:
                 # q_no_pe: [num_tokens, n, qk_head_dim]
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
                 q_no_pe, q_pos_emb = torch.split(
