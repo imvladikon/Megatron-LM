@@ -710,9 +710,11 @@ class AbsorbedMLASelfAttention(Attention):
         expected_rows = self.num_attention_heads_per_partition * (
             self.config.qk_head_dim + self.config.v_head_dim
         )
-        assert self.linear_kv_up_proj.weight.size(0) == expected_rows
-        assert self.linear_kv_up_proj.weight.size(1) == self.config.kv_lora_rank
-        kv_up_weight = self.linear_kv_up_proj.weight.view(
+        # Read once: an adapter-wrapped projection computes its effective weight on every access.
+        kv_up_weight = self.linear_kv_up_proj.weight
+        assert kv_up_weight.size(0) == expected_rows
+        assert kv_up_weight.size(1) == self.config.kv_lora_rank
+        kv_up_weight = kv_up_weight.view(
             self.num_attention_heads_per_partition,
             self.config.qk_head_dim + self.config.v_head_dim,
             self.config.kv_lora_rank,
