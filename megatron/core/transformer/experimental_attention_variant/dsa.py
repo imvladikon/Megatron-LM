@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Iterator, Optional, Tuple, Union
 
 import torch
+import torch.utils.checkpoint
 
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
@@ -79,6 +80,32 @@ def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq
     return layer_number - ((layer_number - skip_topk_offset) % topk_freq)
 
 
+# Per-chunk budget for one FP32 [b, np, rows, skv] score plane in the unfused absorbed path. The whole
+# plane plus softmax intermediates and saved tensors peak at ~7.6x its size per call (A100 measurement),
+# so long sequences are processed in query-row chunks recomputed in backward.
+_ABSORBED_DSA_SCORE_CHUNK_BYTES = 256 * 1024 * 1024
+
+
+def _absorbed_dsa_rows(
+    q_rows: torch.Tensor,
+    k: torch.Tensor,
+    valid_rows: torch.Tensor,
+    value: torch.Tensor,
+    softmax_scale: float,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dense masked attention for a block of query rows: [b,np,rows,hn] x [b,1,hn,skv] -> [b,np,rows,v].
+
+    ``k`` and ``value`` may be FP32 copies of a lower-precision key, so that per-chunk key gradients are
+    summed in FP32; the output is returned in ``out_dtype``.
+    """
+    attention_scores = torch.matmul(q_rows.float(), k.float()) * softmax_scale
+    attention_scores = dsa_masking.masked_softmax(
+        attention_scores, valid_rows.unsqueeze(1).expand_as(attention_scores), dim=-1
+    )
+    return torch.matmul(attention_scores.to(value.dtype), value).to(out_dtype)
+
+
 def _unfused_absorbed_dsa_fn(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -108,12 +135,10 @@ def _unfused_absorbed_dsa_fn(
 
     # [sq,b,np,hn] -> [b,np,sq,hn]
     q = query.permute(1, 2, 0, 3)
-    # [skv,b,1,hn] -> [b,1,hn,skv]
-    k = key.permute(1, 2, 3, 0)
-    attention_scores = torch.matmul(q.float(), k.float()) * softmax_scale
 
-    # Sparse + causal/varlen validity mask.
-    index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
+    # Sparse + causal/varlen validity mask. masked_softmax zeroes invalid entries itself, so only the
+    # boolean validity is kept (adding the -inf bias first would not change any valid score).
+    index_mask = torch.full((b, sq, skv), float("-inf"), device=query.device)
     dsa_masking.scatter_topk_into_index_mask(index_mask, topk_indices, seq_chunk_size=256)
     index_mask = dsa_masking.apply_sparse_validity_to_index_mask(
         index_mask,
@@ -122,16 +147,25 @@ def _unfused_absorbed_dsa_fn(
         varlen_ends=varlen_ends,
         key_positions=key_positions,
     )
-
-    attention_scores = attention_scores + index_mask.unsqueeze(1)
     valid_index_mask = torch.isfinite(index_mask)
-    attention_scores = dsa_masking.masked_softmax(
-        attention_scores.float(), valid_index_mask.unsqueeze(1).expand(b, np, sq, skv), dim=-1
-    )
+    del index_mask
 
-    # Latent value is the first v_channels slice of absorbed key cache.
-    value = key[..., :v_channels].permute(1, 2, 0, 3)  # [b,1,skv,v]
-    output = torch.matmul(attention_scores.to(value.dtype), value)  # [b,np,sq,v]
+    # Scores, softmax and the latent-value mix (first v_channels of the absorbed key) run in FP32 for every
+    # chunking, so results do not depend on sequence length; one FP32 key copy also accumulates the
+    # per-chunk key gradients in FP32 before the single cast back to the key dtype.
+    key_fp32 = key.float()
+    k_fp32 = key_fp32.permute(1, 2, 3, 0)  # [b,1,hn,skv]
+    value_fp32 = key_fp32[..., :v_channels].permute(1, 2, 0, 3)  # [b,1,skv,v]
+    rows = max(1, _ABSORBED_DSA_SCORE_CHUNK_BYTES // (4 * b * np * skv))
+    recompute = rows < sq and torch.is_grad_enabled() and (query.requires_grad or key.requires_grad)
+    chunks = []
+    for s0 in range(0, sq, rows):
+        args = (q[:, :, s0 : s0 + rows], k_fp32, valid_index_mask[:, s0 : s0 + rows], value_fp32, softmax_scale, key.dtype)
+        if recompute:
+            chunks.append(torch.utils.checkpoint.checkpoint(_absorbed_dsa_rows, *args, use_reentrant=False))
+        else:
+            chunks.append(_absorbed_dsa_rows(*args))
+    output = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=2)  # [b,np,sq,v]
     return output.permute(2, 0, 1, 3).contiguous()
 
 
