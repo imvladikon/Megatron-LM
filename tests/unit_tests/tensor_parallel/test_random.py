@@ -410,3 +410,39 @@ def test_checkpoint_without_output_retain_input_tensors(use_manager):
         assert torch.allclose(ref_input_grad, input2.grad)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("use_manager", [False, True])
+def test_checkpoint_without_output_inputs_without_grad(use_manager):
+    """A checkpoint whose inputs do not require grad (a frozen norm under LoRA) records no autograd
+    node, so ctx.saved_tensors is empty; its discarded output must still be recomputed for a trainable
+    consumer."""
+    frozen_weight = torch.randn(8)
+    adapter = torch.randn(8, 8, requires_grad=True)
+
+    def frozen_norm(x):
+        return torch.nn.functional.rms_norm(x, (8,), frozen_weight)
+
+    def checkpoint_forward(x):
+        manager = CheckpointWithoutOutputManager() if use_manager else None
+        ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
+        normed = ckpt.checkpoint(frozen_norm, x)
+        y = normed @ adapter
+        if manager is None:
+            ckpt.discard_output_and_register_recompute(y)
+        else:
+            manager.discard_all_outputs_and_register_unified_recompute(y)
+        return y
+
+    Utils.initialize_model_parallel()
+    try:
+        x = torch.randn(4, 8)
+        grad = torch.randn(4, 8)
+        (frozen_norm(x) @ adapter).backward(grad)
+        ref_adapter_grad = adapter.grad.clone()
+
+        adapter.grad = None
+        checkpoint_forward(x).backward(grad)
+        assert torch.allclose(ref_adapter_grad, adapter.grad)
+    finally:
+        Utils.destroy_model_parallel()

@@ -712,6 +712,11 @@ def _save_args_to_ctx(ctx, args):
     # pinning the input storage on GPU for the whole forward-backward interval.
     # _load_args_from_ctx() detaches the unpacked tensors before they are reused.
     ctx.save_for_backward(*tensor_args)
+    if not any(t.requires_grad for t in tensor_args):
+        # Function.apply records no autograd node when no input requires grad, and ctx.saved_tensors is
+        # then empty. The output is still discarded and recomputed for downstream consumers that need it
+        # (a frozen norm feeding a LoRA projection), so keep the inputs on ctx for the recomputation.
+        ctx._tensor_args_without_grad = tuple(tensor_args)
     ctx._non_tensor_entries = tuple(non_tensor_entries)
     ctx._total_args_count = len(args)
 
@@ -732,7 +737,10 @@ def _load_args_from_ctx(ctx):
         detached.requires_grad_(tensor.requires_grad)
         return detached
 
-    tensor_iter = iter(_detach_with_grad(t) for t in ctx.saved_tensors)
+    saved_tensors = getattr(ctx, "_tensor_args_without_grad", None)
+    if saved_tensors is None:
+        saved_tensors = ctx.saved_tensors
+    tensor_iter = iter(_detach_with_grad(t) for t in saved_tensors)
     total_args_count = ctx._total_args_count
     non_tensor_map = dict(ctx._non_tensor_entries)
 
