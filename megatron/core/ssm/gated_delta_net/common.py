@@ -20,6 +20,10 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.fla_autotune import (
+    fla_autotune_pinning_requested,
+    pin_fla_autotune_meta_parameters,
+)
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
     _all_to_all_hp2cp,
@@ -152,6 +156,8 @@ class _GDNBase(MegatronModule):
                 "FLA is not installed. Please install it with "
                 "`pip install flash-linear-attention[cuda]`."
             )
+        if fla_autotune_pinning_requested():
+            pin_fla_autotune_meta_parameters()
 
         super().__init__(config)
 
