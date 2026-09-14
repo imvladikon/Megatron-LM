@@ -783,11 +783,30 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
         # tensors later for recomputation
         checkpoint_without_output_obj.ctx = ctx
+        # Keep a handle to the checkpoint object so backward() can trigger the recompute
+        # itself when the registered grad hook has not fired yet (see backward()).
+        ctx.checkpoint_without_output_obj = checkpoint_without_output_obj
         return outputs
 
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
+        # The recompute normally runs from the grad hook registered on the hook tensor
+        # (discard_output_and_register_recompute / the manager's unified hook). Autograd does
+        # not guarantee that hook to run before this backward: with per-layer mHC recompute
+        # blocks (mhc_recompute_layer_num) the block-boundary tensor is not on every
+        # gradient path into the block, so backward() could arrive here with ctx.inputs
+        # unset ("'CheckpointWithoutOutputFunctionBackward' object has no attribute 'inputs'").
+        # In that case run the recompute now: through the manager when there is one (the
+        # checkpoints of a block depend on each other's outputs, so they are recomputed in
+        # forward order), otherwise for this checkpoint alone. _recompute() is idempotent.
+        if getattr(ctx, "inputs", None) is None:
+            ckpt_obj = getattr(ctx, "checkpoint_without_output_obj", None)
+            if ckpt_obj is not None and ckpt_obj.ctx is not None:
+                if ckpt_obj.ckpt_manager is not None:
+                    ckpt_obj.ckpt_manager._unified_recompute_hook(None)
+                else:
+                    ckpt_obj._recompute(None)
         # Get the inputs from the context instead of the saved tensors
         # because the saved tensors are already cached by the recomputation.
         # This is to avoid double-reloading the inputs in CPU offloading scenario.
