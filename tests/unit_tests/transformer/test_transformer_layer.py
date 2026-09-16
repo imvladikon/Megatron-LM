@@ -1502,3 +1502,66 @@ class TestMHCWithOffloading:
             f"Gradients differ: max diff = "
             f"{(grad_no_offload - grad_offload).abs().max().item()}"
         )
+
+
+class TestRawMlpPathLayernormRecompute:
+    """Hybrid (mHC) layers take the raw MLP path, which must honour recompute_modules=["layernorm"].
+
+    Guards a silent regression: _forward_mlp_output_with_bias builds the pre-MLP norm checkpoint
+    but, unlike _apply_mlp_bda_step, nothing else discards its output, so dropping the discard call
+    leaves the norm activation resident and the recompute never runs.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _run(recompute: bool):
+        recompute_kwargs = (
+            dict(recompute_granularity="selective", recompute_modules=["layernorm"])
+            if recompute
+            else {}
+        )
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            **recompute_kwargs,
+        )
+        torch.manual_seed(0)
+        layer = TransformerLayer(config, get_gpt_layer_local_spec().submodules, layer_number=1)
+        layer = layer.cuda()
+        layer.train()
+        torch.manual_seed(7)
+        hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
+
+        (mlp_output, _bias), _residual = layer._forward_mlp_output_with_bias(hidden_states)
+        checkpoint = getattr(layer, "pre_mlp_norm_checkpoint", None)
+        norm_output_bytes = (
+            None if checkpoint is None else checkpoint.outputs[0].untyped_storage().size()
+        )
+        mlp_output.float().sum().backward()
+
+        grads = {name: p.grad.clone() for name, p in layer.named_parameters() if p.grad is not None}
+        grads["input"] = hidden_states.grad.clone()
+        return norm_output_bytes, grads
+
+    def test_pre_mlp_norm_output_is_discarded_and_grads_are_unchanged(self):
+        plain_bytes, plain_grads = self._run(recompute=False)
+        recompute_bytes, recompute_grads = self._run(recompute=True)
+
+        assert plain_bytes is None, "no checkpoint is expected without selective recompute"
+        assert recompute_bytes == 0, (
+            "the pre-MLP norm output must be discarded on the raw MLP path, "
+            f"got {recompute_bytes} bytes still resident"
+        )
+        assert set(plain_grads) == set(recompute_grads)
+        for name, grad in plain_grads.items():
+            torch.testing.assert_close(recompute_grads[name], grad, rtol=1e-5, atol=1e-6)

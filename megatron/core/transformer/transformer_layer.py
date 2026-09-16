@@ -1084,6 +1084,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
             mlp_output_with_bias = (mlp_output, mlp_bias)
 
+        if self.recompute_pre_mlp_layernorm:
+            # Same contract as _apply_mlp_bda_step, which raw HybridStack callers bypass: discard the
+            # pre-MLP norm output and recompute it from the gradient hook of the MLP output.
+            self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(mlp_output_with_bias[0])
+
         return mlp_output_with_bias, residual
 
     def _forward_mlp(
