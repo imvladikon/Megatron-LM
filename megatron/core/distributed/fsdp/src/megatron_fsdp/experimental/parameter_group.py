@@ -206,7 +206,7 @@ class FsdpParameterGroup:
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
         # All weight and gradient buffers share the same packing and padding.
-        layout = GlobalLayout.build(
+        layout = GlobalLayout.build_for_row_atomic(
             (parameter.shape for parameter in parameters),
             dp_size=self.mesh.size(),
             block_size=32 if self.dtype == torch.uint8 else 1,
@@ -474,8 +474,8 @@ class FsdpParameterGroup:
         accumulating each backward through the standard zero_grad contract; the
         last microbatch reduces the DP-outer axes, finalizing main_grad to
         main_weight's placements (all-reduce to Replicate for HSDP, reduce-scatter
-        to Flat for HFSDP) so ``.grad`` is the fully reduced gradient before
-        ``optimizer.step()``. With every axis Flat (plain DP) main_grad already
+        to RowAtomic for HFSDP) so ``.grad`` is the fully reduced gradient before
+        ``optimizer.step()``. With every axis RowAtomic (plain DP) main_grad already
         rests finalized.
         """
         assert self.main_grad is not None
